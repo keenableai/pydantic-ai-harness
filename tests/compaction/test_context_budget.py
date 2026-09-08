@@ -7,12 +7,14 @@ from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import pydantic_ai.messages as messages_module
 import pytest
-from opentelemetry.trace import NoOpTracer, Tracer
+from opentelemetry.trace import NoOpTracer, Tracer, get_tracer
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     ModelMessage,
+    ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     SpeechPart,
@@ -26,8 +28,10 @@ from pydantic_ai.models import AbstractModel, Model, ModelRequestContext, ModelR
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
-from pydantic_ai.usage import RequestUsage, RunUsage
+from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 
+import pydantic_ai_harness
+import pydantic_ai_harness.compaction as compaction
 from pydantic_ai_harness.compaction import (
     DEFAULT_CONTEXT_WINDOW,
     ClearToolResults,
@@ -87,6 +91,7 @@ def _ctx(model: Any = None) -> Any:
     @dataclasses.dataclass
     class _FakeCtx:
         usage: RunUsage = dataclasses.field(default_factory=RunUsage)
+        usage_limits: UsageLimits | None = None
         model: Model = dataclasses.field(default_factory=TestModel)
         deps: None = None
         tracer: Tracer = dataclasses.field(default_factory=NoOpTracer)
@@ -1151,7 +1156,6 @@ class TestCompactNowSpan:
         return [s for s in capfire.exporter.exported_spans_as_dict() if s['name'] == 'compact_messages']
 
     async def test_emits_the_compaction_span(self, capfire: CaptureLogfire):
-        from opentelemetry.trace import get_tracer
 
         strategy: SlidingWindowCompaction[None] = SlidingWindowCompaction(max_tokens=1, keep_messages=2)
 
@@ -1166,7 +1170,6 @@ class TestCompactNowSpan:
 
     async def test_the_span_is_measured_with_the_tokenizer_it_was_given(self, capfire: CaptureLogfire):
         """Without it the manual path reports the heuristic where the in-run path reported a real count."""
-        from opentelemetry.trace import get_tracer
 
         strategy: SlidingWindowCompaction[None] = SlidingWindowCompaction(max_tokens=1, keep_messages=2)
         messages = _history(4)
@@ -1178,7 +1181,6 @@ class TestCompactNowSpan:
         assert attributes['compaction.tokens_before'] == characters, 'the 4-characters heuristic was used instead'
 
     async def test_no_span_when_the_history_is_unchanged(self, capfire: CaptureLogfire):
-        from opentelemetry.trace import get_tracer
 
         tiered: TieredCompaction[None] = TieredCompaction(
             tiers=[SlidingWindowCompaction(max_tokens=1, keep_messages=2)],
@@ -1190,7 +1192,6 @@ class TestCompactNowSpan:
         assert self._spans(capfire) == []
 
     async def test_the_span_names_the_focused_strategy(self, capfire: CaptureLogfire):
-        from opentelemetry.trace import get_tracer
 
         tiered: TieredCompaction[None] = TieredCompaction(
             tiers=[SlidingWindowCompaction(max_tokens=1, keep_messages=2)],
@@ -1229,8 +1230,6 @@ class TestWithFocus:
 
 class TestNewExports:
     def test_capability_exposed_at_top_level(self):
-        import pydantic_ai_harness
-        import pydantic_ai_harness.compaction as compaction
 
         assert pydantic_ai_harness.ReportContextUsage is compaction.ReportContextUsage
 
@@ -1246,7 +1245,9 @@ class TestPositionalCompatibility:
         assert SlidingWindowCompaction(None, 1_000, 40).keep_messages == 40
 
     def test_summarizing_compaction(self):
-        assert SummarizingCompaction('openai:gpt-4o', None, 1_000, 15).keep_messages == 15
+        strategy = SummarizingCompaction('openai:gpt-4o', None, 1_000, 15, None, '{messages}', len)
+        assert strategy.keep_messages == 15
+        assert strategy.tokenizer is len
 
     def test_clear_tool_results(self):
         assert ClearToolResults(None, 1_000, 5).keep_pairs == 5
@@ -1263,11 +1264,11 @@ class TestPositionalCompatibility:
         assert WarnNearLimits(10, 1_000, 2_000).max_total_tokens == 2_000
 
     def test_the_new_fields_stay_keyword_only(self):
-        import dataclasses
 
         cases = [
             (SlidingWindowCompaction, 'max_fraction'),
             (SummarizingCompaction, 'max_fraction'),
+            (SummarizingCompaction, 'instructions'),
             (ClearToolResults, 'max_fraction'),
             (DeduplicateFileReads, 'max_fraction'),
             (TieredCompaction, 'target_fraction'),
@@ -1379,6 +1380,45 @@ class TestManualCompactionSemantics:
 # ---------------------------------------------------------------------------
 # Realtime models (#585)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not hasattr(messages_module, 'InstructionDeltaPart'), reason='requires core instruction updates')
+class TestInstructionDeltaCounting:
+    def test_superseded_updates_do_not_count(self) -> None:  # pragma: lax no cover
+        history = ModelMessagesTypeAdapter.validate_python(
+            [
+                {
+                    'kind': 'request',
+                    'parts': [{'part_kind': 'instruction-delta', 'id': 'agent:state', 'content': 'B' * 400}],
+                },
+                {'kind': 'response', 'parts': [{'part_kind': 'text', 'content': 'done'}]},
+                {
+                    'kind': 'request',
+                    'parts': [{'part_kind': 'user-prompt', 'content': 'Continue.'}],
+                    'instruction_baseline': {},
+                    'instructions': 'C',
+                },
+            ]
+        )
+        assert estimate_token_count(history, len) == estimate_token_count(TestModel().prepare_messages(history), len)
+
+    @pytest.mark.parametrize(
+        ('content', 'rendered'),
+        [
+            ('New state', "Instruction block 'agent:state' is replaced from this point onward by:\n\nNew state"),
+            (None, "Instruction block 'agent:state' is withdrawn. Its previous instructions no longer apply."),
+        ],
+    )
+    def test_rendered_updates_count(self, content: str | None, rendered: str) -> None:  # pragma: lax no cover
+        history = ModelMessagesTypeAdapter.validate_python(
+            [
+                {
+                    'kind': 'request',
+                    'parts': [{'part_kind': 'instruction-delta', 'id': 'agent:state', 'content': content}],
+                }
+            ]
+        )
+        assert estimate_token_count(history, len) == len(rendered)
 
 
 class TestSpeechPartCounting:

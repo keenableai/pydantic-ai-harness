@@ -9,7 +9,7 @@ Compaction is a menu of strategies for keeping an agent's conversation history w
 
 All strategies preserve tool-call / tool-return **pairing**. Core does not validate this, and a provider rejects an orphaned pair, so the pairing guarantee is what makes these safe to drop into an agent. The zero-LLM strategies never call a model; only `SummarizingCompaction` (and `TieredCompaction` when it escalates that far) spends tokens.
 
-On OpenAI and Anthropic, core also ships [provider-native compaction](https://pydantic.dev/docs/ai/capabilities/compaction/) — the provider summarizes history server-side. The strategies on this page are the model-agnostic alternative: they work with every model and keep the compaction logic (and its costs) under your control.
+On OpenAI and Anthropic, core also ships [provider-native compaction](https://pydantic.dev/docs/ai/capabilities/compaction/) -- the provider summarizes history server-side. The strategies on this page are the model-agnostic alternative: they work with every model and keep the compaction logic (and its costs) under your control.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/compaction/)
 
@@ -34,6 +34,8 @@ An agent that runs for many turns accumulates history: tool outputs, file reads,
 | `ReportContextUsage` | zero-LLM | Reports context usage to your application; never edits history | You want a live context gauge in a UI |
 
 ## Triggers
+
+Instruction replacement and withdrawal records contribute their full rendered system text to token estimates. Superseded updates before a new instruction baseline are excluded.
 
 Every size-based strategy triggers on `max_messages`, `max_tokens` (estimated), or `max_fraction`. Token counts anchor on the provider-reported usage of the most recent model response when one is available. That provider usage includes the instructions, tool definitions, and `FilePart` payloads sent in the anchored request; only the messages added since are estimated. The suffix after the anchor, or a history with no usage anchor, uses `tokenizer` or a ~4-chars-per-token heuristic and cannot see `FilePart` payloads. Pending tool schemas newly revealed for the request are conservatively estimated by the implementation. `DeduplicateFileReads` runs on every request when no trigger is set (it is cheap and near-lossless). `TieredCompaction` triggers and stops on a single `target_tokens` / `target_fraction` budget. `ClampOversizedMessages` triggers per *part* (`max_part_tokens` / `max_part_chars`), not on the whole history -- the failure it targets is one oversized part, not a large total.
 
@@ -339,11 +341,35 @@ agent = Agent(
 )
 ```
 
-`model` accepts a model name or a `Model`; when left `None` it inherits the running agent's model. No token caps are imposed on the summary call. By default `incremental=True` updates the newest existing summary as an anchor. This changes the summary-call prompt from earlier releases; set `incremental=False` to retain the prior regeneration behavior.
+`model` accepts a model name or a `Model`; when left `None` it inherits the running agent's model. Its nested summary run inherits the parent usage limits and reserves one request from a finite request limit for the pending parent request. Pass `model_settings` to give the dedicated summary call settings that differ from defaults carried by that model; the supplied settings merge over the model defaults without mutating the model or the settings dictionary. By default `incremental=True` updates the newest existing summary as an anchor. This changes the summary-call prompt from earlier releases; set `incremental=False` to retain the prior regeneration behavior.
+
+Both prompt surfaces of the summary request are fields: `summary_prompt` is the user-turn template (it must contain a `{messages}` placeholder), and `instructions` sets the internal agent's static instructions, which Pydantic AI sends in the request's system prompt. Override `instructions` when the summarizer endpoint requires a fixed leading instruction.
+
+The summary request is non-streaming unless `event_stream_handler` is set. Supply a handler to watch the summary as it is written, or pass `drain_summary_events` to take the streaming request path without handling the events -- which is what a summarizer endpoint that rejects non-streaming requests needs:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness.compaction import SummarizingCompaction, drain_summary_events
+
+agent = Agent(
+    'openai:gpt-5.6-terra',
+    capabilities=[
+        SummarizingCompaction(max_messages=60, event_stream_handler=drain_summary_events),
+    ],
+)
+```
+
+Neither transport works everywhere, which is why this is a choice rather than a default: some endpoints reject non-streaming requests and others reject streaming ones. The handler receives the summary run's own `RunContext` and event stream; the outer `Agent.run(...)` handler is not inherited and never sees the summary token deltas.
 
 ### Usage accounting
 
-The summary call is a real request to the model, so its full usage -- tokens **and** the request itself -- is folded into the run's `ctx.usage`. This is deliberate: it keeps cost honest, keeps the request count consistent (a model request that did not count as one would be the surprise), and lets a `UsageLimits` request limit catch a runaway compaction. A run-request or iteration limiter will therefore see compaction calls among its requests.
+The summary call is a real request to the model, so its full usage -- tokens **and** the request itself -- is folded into the run's `ctx.usage`. This is deliberate: it keeps cost honest, keeps the request count consistent (a model request that did not count as one would be the surprise), and lets a `UsageLimits` request limit catch a runaway compaction. The nested run receives the other parent limits unchanged; the finite request limit is reduced by one so it cannot spend the slot already approved for the parent request. A run-request or iteration limiter will therefore see compaction calls among its requests.
+
+With a durable-execution capability attached, the summary call runs as a contributed durable
+operation, so replay uses the recorded summary instead of calling the model again. When `model` is
+not set, the operation uses the run's model. The capability carries a stable default `id`, which
+durable execution uses to recover the operation by the same identity. Overriding it with a custom
+value orphans recorded operations for in-flight workflows, so keep it fixed once a workflow is live.
 
 ## `WarnNearLimits`: warn instead of rewrite
 

@@ -197,14 +197,25 @@ for path in root.rglob('*'):
 
 ## Usage accounting
 
-A `Summarize` call is a real request to the model, so its full usage -- tokens and the
-request itself -- folds into the run's `ctx.usage`, exactly like `SummarizingCompaction`. No
-token caps are imposed on the summary call. A `UsageLimits` request limit will see it.
+A built-in `Summarize` call is a real request to the model, so its full usage -- tokens and the
+request itself -- folds into the run's `ctx.usage`, exactly like `SummarizingCompaction`. Its nested
+run receives the parent limits unchanged except that a finite request limit reserves one request for
+the pending parent request.
 
 By default `Summarize` inherits the running agent's model (`ctx.model`). Pass a model id or
 instance to `Summarize(model=...)` to override, or a `summarize` callable to bypass the
 built-in prompt entirely. The `summary_prompt` template on the capability must contain both
 `{tool_name}` and `{output}` placeholders.
+
+With a durable-execution capability attached, built-in model summarization is a journaled
+capability operation. `ToolOutputLimits` carries the stable default `id='tool_output_limits'`, so
+durable recovery works without configuration.
+
+Two details matter when choosing a band under durability. The text being summarized is part of the
+journaled operation input, so prefer `Spill` over built-in `Summarize` for outputs near the
+engine's payload limit. And a custom `summarize` callable runs directly rather than as a durable
+operation -- arbitrary callables cannot be reconstructed on the worker side -- so it may be called
+again on replay.
 
 ## Edge cases
 
