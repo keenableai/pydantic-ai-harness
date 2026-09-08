@@ -22,9 +22,9 @@ agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[KeenableSearch()])
 
 The capability adds two tools:
 
-- `web_search(query)` — returns the matching pages with title, URL, and a short
+- `web_search(query)`: returns the matching pages with title, URL, and a short
   excerpt of each.
-- `get_page(url)` — retrieves one page as markdown.
+- `get_page(url)`: retrieves one page as markdown.
 
 Both return a `ToolReturn` whose `metadata['sources']` lists the URLs and
 titles behind the result, so an application can render citations from
@@ -53,7 +53,7 @@ agent = Agent(
 | `num_results` | `5` | How many results `web_search` returns. |
 | `max_snippet_chars` | `500` | Excerpt budget per search result. |
 | `max_page_chars` | `10_000` | Page budget for `get_page`; longer pages are truncated and marked, with the marker counted against the budget. |
-| `guidance` | `None` | Replaces the default research instructions; `''` contributes none. |
+| `guidance` | `None` | Replaces the default research instructions, keeping the untrusted-content rule; `''` contributes none. |
 | `client` | `None` | A `KeenableClient` to use instead of the default HTTP client. |
 
 `max_snippet_chars` exists because Keenable returns whole-page text on every
@@ -87,8 +87,21 @@ KeenableSearch(client=HttpKeenableClient(api_key='keen_...'))
 Any object satisfying the `KeenableClient` protocol works, which is also how
 tests substitute a fake.
 
+For a proxy, a self-hosted deployment, or a `KeenableClient` of your own, this
+is what the default client sends. `search` posts a JSON body `{"query": ...}`
+to `/v1/search`, or to `/v1/search/public` when there is no key, and returns
+the response's `results` list. `fetch` sends `GET /v1/fetch`, or
+`/v1/fetch/public` when keyless, with the page address in the `url` query
+parameter, and returns the response object; the toolset reads its `content`,
+`title`, and `url`. Every request carries an `X-Keenable-Title: Pydantic AI
+Harness` header, adds `X-API-Key` when a key is set, and times out after 30
+seconds.
+
 ## Errors
 
-Rate limits, transient 5xx responses, and network failures become `ModelRetry`,
-so the model can wait and rephrase rather than aborting the run. A `401`/`403`
-propagates: a rejected API key is configuration the model cannot fix.
+Any HTTP error status other than `401`, `402`, and `403` becomes `ModelRetry`,
+as do network failures and a `2xx` whose body is not JSON, so the model can
+wait, rephrase, or try another URL rather than abort the run. A `get_page` call
+that comes back with no readable content is a `ModelRetry` too. A `401`, `402`,
+or `403` propagates as `httpx.HTTPStatusError`: a rejected key or an exhausted
+account is configuration the model cannot fix.

@@ -24,8 +24,8 @@ Getting there usually also means an account, an API key, and another vendor SDK
 in the dependency tree before the first query runs.
 
 `KeenableSearch` bundles the plumbing into a single
-[capability](/ai/core-concepts/capabilities/) — the two tools, their output
-budgets, and short research guidance in the system prompt — and needs neither a
+[capability](/ai/core-concepts/capabilities/): the two tools, their output
+budgets, and short research guidance in the system prompt. It needs neither a
 key nor an install to run.
 
 ## Usage
@@ -45,9 +45,9 @@ print(result.output)
 
 The capability adds two tools:
 
-- `web_search(query)` — the matching pages, each with title, URL, and a short
+- `web_search(query)`: the matching pages, each with title, URL, and a short
   excerpt.
-- `get_page(url)` — one page as markdown.
+- `get_page(url)`: one page as markdown.
 
 Both return a [`ToolReturn`][pydantic_ai.messages.ToolReturn] whose
 `metadata['sources']` lists the URLs and titles behind the result, so an
@@ -78,7 +78,7 @@ agent = Agent(
 | `num_results` | `5` | How many results `web_search` returns. |
 | `max_snippet_chars` | `500` | Excerpt budget per search result. |
 | `max_page_chars` | `10_000` | Page budget for `get_page`; longer pages are truncated and marked, with the marker counted against the budget. |
-| `guidance` | `None` | Replaces the default research instructions; `''` contributes none. |
+| `guidance` | `None` | Replaces the default research instructions, keeping the untrusted-content rule; `''` contributes none. |
 | `client` | `None` | A `KeenableClient` to use instead of the default HTTP client. |
 
 `max_snippet_chars` exists because Keenable returns whole-page text on every
@@ -112,11 +112,24 @@ KeenableSearch(client=HttpKeenableClient(api_key='keen_...'))
 Any object satisfying the `KeenableClient` protocol works, which is also how
 tests substitute a fake.
 
+For a proxy, a self-hosted deployment, or a `KeenableClient` of your own, this
+is what the default client sends. `search` posts a JSON body `{"query": ...}`
+to `/v1/search`, or to `/v1/search/public` when there is no key, and returns
+the response's `results` list. `fetch` sends `GET /v1/fetch`, or
+`/v1/fetch/public` when keyless, with the page address in the `url` query
+parameter, and returns the response object; the toolset reads its `content`,
+`title`, and `url`. Every request carries an `X-Keenable-Title: Pydantic AI
+Harness` header, adds `X-API-Key` when a key is set, and times out after 30
+seconds.
+
 ## Errors
 
-Rate limits, transient 5xx responses, and network failures become
-[`ModelRetry`][pydantic_ai.exceptions.ModelRetry], so the model can wait and
-rephrase rather than aborting the run. A `401`/`403` propagates: a rejected API
-key is configuration the model cannot fix.
+Any HTTP error status other than `401`, `402`, and `403` becomes
+[`ModelRetry`][pydantic_ai.exceptions.ModelRetry], as do network failures and
+a `2xx` whose body is not JSON, so the model can wait, rephrase, or try another
+URL rather than abort the run. A `get_page` call that comes back with no
+readable content is a `ModelRetry` too. A `401`, `402`, or `403` propagates as
+`httpx.HTTPStatusError`: a rejected key or an exhausted account is
+configuration the model cannot fix.
 
 ::: pydantic_ai_harness.KeenableSearch

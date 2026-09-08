@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -216,7 +218,7 @@ async def test_get_page_retries_on_empty_content():
         await _toolset(client).get_page('https://example.com/one')
 
 
-@pytest.mark.parametrize('status', [429, 500])
+@pytest.mark.parametrize('status', [404, 429, 500])
 async def test_transient_http_errors_become_retries(status: int):
     request = httpx.Request('POST', 'https://api.keenable.ai/v1/search/public')
     error = httpx.HTTPStatusError('boom', request=request, response=httpx.Response(status, request=request))
@@ -226,7 +228,7 @@ async def test_transient_http_errors_become_retries(status: int):
         await _toolset(client).web_search('cats')
 
 
-@pytest.mark.parametrize('status', [401, 403])
+@pytest.mark.parametrize('status', [401, 402, 403])
 async def test_auth_errors_propagate(status: int):
     request = httpx.Request('POST', 'https://api.keenable.ai/v1/search')
     error = httpx.HTTPStatusError('nope', request=request, response=httpx.Response(status, request=request))
@@ -253,7 +255,13 @@ def test_default_instructions_mention_both_tools():
 
 
 def test_guidance_overrides_and_disables_instructions():
-    assert KeenableSearch[None](guidance='Just search.').get_instructions() == 'Just search.'
+    # Custom guidance replaces the research advice, but the untrusted-content
+    # rule rides along: it is the only prompt-injection mitigation shipped here.
+    instructions = KeenableSearch[None](guidance='Just search.').get_instructions()
+
+    assert isinstance(instructions, str)
+    assert instructions.startswith('Just search. ')
+    assert 'untrusted' in instructions
     assert KeenableSearch[None](guidance='').get_instructions() is None
 
 
@@ -296,23 +304,63 @@ def test_from_spec_builds_the_default_client():
     assert isinstance(capability.get_toolset(), KeenableSearchToolset)
 
 
-def test_default_client_is_keyless(monkeypatch: pytest.MonkeyPatch):
+def _capture_requests(monkeypatch: pytest.MonkeyPatch, respond: Callable[[httpx.Request], httpx.Response]):
+    """Route every `httpx.AsyncClient` the code builds through `respond`, recording the requests."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return respond(request)
+
+    transport = httpx.MockTransport(handler)
+    original = httpx.AsyncClient
+
+    def patched(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return original(*args, **{**kwargs, 'transport': transport})
+
+    monkeypatch.setattr(httpx, 'AsyncClient', patched)
+    return seen
+
+
+async def test_default_client_is_keyless(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv('KEENABLE_API_KEY', raising=False)
     monkeypatch.delenv('KEENABLE_API_URL', raising=False)
+    seen = _capture_requests(monkeypatch, lambda _request: httpx.Response(200, json={'results': []}))
 
-    client = HttpKeenableClient()
+    await HttpKeenableClient().search('cats')
+    await HttpKeenableClient().fetch('https://example.com/one')
 
-    assert 'X-API-Key' not in client._headers()  # pyright: ignore[reportPrivateUsage]
-    assert client._path('/v1/search', '/v1/search/public') == '/v1/search/public'  # pyright: ignore[reportPrivateUsage]
+    assert [request.url.path for request in seen] == ['/v1/search/public', '/v1/fetch/public']
+    assert all('x-api-key' not in request.headers for request in seen)
+    assert all(request.headers['x-keenable-title'] == 'Pydantic AI Harness' for request in seen)
 
 
-def test_api_key_selects_the_keyed_endpoint(monkeypatch: pytest.MonkeyPatch):
+async def test_api_key_selects_the_keyed_endpoint(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv('KEENABLE_API_KEY', 'keen_live_x')
+    monkeypatch.delenv('KEENABLE_API_URL', raising=False)
+    seen = _capture_requests(monkeypatch, lambda _request: httpx.Response(200, json={'results': []}))
 
-    client = HttpKeenableClient()
+    await HttpKeenableClient().search('cats')
+    await HttpKeenableClient().fetch('https://example.com/one')
 
-    assert client._headers()['X-API-Key'] == 'keen_live_x'  # pyright: ignore[reportPrivateUsage]
-    assert client._path('/v1/search', '/v1/search/public') == '/v1/search'  # pyright: ignore[reportPrivateUsage]
+    assert [request.url.path for request in seen] == ['/v1/search', '/v1/fetch']
+    assert all(request.headers['x-api-key'] == 'keen_live_x' for request in seen)
+    # The key travels only as a header: never in the URL, never in the body.
+    assert all('keen_live_x' not in str(request.url) and b'keen_live_x' not in request.content for request in seen)
+
+
+@pytest.mark.parametrize('body', [b'', b'<html>gateway timeout</html>'])
+async def test_malformed_2xx_bodies_become_retries(monkeypatch: pytest.MonkeyPatch, body: bytes):
+    # A 2xx that is not JSON is neither an `httpx.HTTPError` nor a deliberate
+    # exception; without this it would kill the run as a bare decode error.
+    monkeypatch.delenv('KEENABLE_API_KEY', raising=False)
+    _capture_requests(monkeypatch, lambda _request: httpx.Response(200, content=body))
+    toolset = KeenableSearchToolset[None](client=None, num_results=5, max_snippet_chars=500, max_page_chars=10_000)
+
+    with pytest.raises(ModelRetry, match='malformed response'):
+        await toolset.web_search('cats')
+    with pytest.raises(ModelRetry, match='malformed response'):
+        await toolset.get_page('https://example.com/one')
 
 
 @pytest.mark.parametrize('base_url', ['http://localhost:8080', 'https://keenable.internal'])
@@ -346,6 +394,7 @@ async def test_http_client_parses_search_and_fetch(monkeypatch: pytest.MonkeyPat
         seen['url'] = str(request.url)
         seen['headers'] = dict(request.headers)
         if request.url.path.startswith('/v1/search'):
+            seen['body'] = json.loads(request.content)
             return httpx.Response(200, json={'results': [_result('https://example.com/one'), 'not-a-dict']})
         return httpx.Response(200, json={'content': '# A page'})
 
@@ -362,6 +411,7 @@ async def test_http_client_parses_search_and_fetch(monkeypatch: pytest.MonkeyPat
     results = await client.search('cats')
     assert results == [_result('https://example.com/one')]
     assert seen['url'] == 'https://api.keenable.ai/v1/search/public'
+    assert seen['body'] == {'query': 'cats'}
     assert seen['headers']['x-keenable-title'] == 'Pydantic AI Harness'
 
     page = await client.fetch('https://example.com/one')

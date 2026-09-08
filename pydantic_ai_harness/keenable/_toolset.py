@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Concatenate, ParamSpec, Protocol, TypedDict, TypeVar, cast
@@ -28,9 +29,10 @@ _P = ParamSpec('_P')
 _R = TypeVar('_R')
 _SelfT = TypeVar('_SelfT')
 
-# Keenable answers a bad or missing key with 401/403. That is configuration the
-# model cannot correct, so it propagates instead of becoming a retry prompt.
-_AUTH_STATUSES = frozenset({401, 403})
+# 401/402/403 are authentication, billing, or authorization states the model
+# cannot correct, so they propagate and abort the run instead of becoming a
+# retry prompt that would loop until the retry limit.
+_AUTH_STATUSES = frozenset({401, 402, 403})
 
 
 class KeenableSource(TypedDict):
@@ -100,7 +102,7 @@ class HttpKeenableClient:
         async with httpx.AsyncClient(timeout=KEENABLE_REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.post(
                 f'{self._base_url}{self._path("/v1/search", "/v1/search/public")}',
-                json={'query': query, 'mode': 'pro'},
+                json={'query': query},
                 headers=self._headers(),
             )
         response.raise_for_status()
@@ -178,9 +180,11 @@ def _recoverable(
 
     Pydantic AI only feeds `ModelRetry` back to the model as a retry prompt;
     any other exception propagates and aborts the run. Rate limits, transient
-    5xx, and rejected parameters are things a model can recover from (wait,
-    rephrase, narrow the query), so they become retries. A 401/403 means a bad
-    API key -- configuration the model cannot fix -- so it propagates.
+    5xx, rejected parameters, a 404 on a dead URL, and a 2xx whose body is not
+    JSON (a proxy or gateway answering in HTML) are things a model can recover
+    from (wait, rephrase, pick another URL), so they become retries. A
+    401/402/403 means a bad key or an exhausted account, configuration the
+    model cannot fix, so it propagates.
     """
 
     @functools.wraps(fn)
@@ -193,6 +197,8 @@ def _recoverable(
             raise ModelRetry(f'Keenable request failed: {error}') from error
         except httpx.HTTPError as error:
             raise ModelRetry(f'Keenable request failed: {error}') from error
+        except json.JSONDecodeError as error:
+            raise ModelRetry(f'Keenable returned a malformed response: {error}') from error
 
     return wrapper
 
